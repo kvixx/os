@@ -1,0 +1,475 @@
+════════════════════════════════════════════════════════
+FILE: ./domain/cpu.rs
+════════════════════════════════════════════════════════
+/// Модель центрального процессора.
+///
+/// Активный процесс хранится в виде индекса в таблице PSW — это
+/// идиоматично для Rust и позволяет обойтись без `Rc<RefCell<_>>`.
+#[derive(Debug)]
+pub struct Cpu {
+    pub id: u32,
+    pub active_slot: Option<usize>,
+    pub hardware_command_counter: u64,
+}
+
+impl Cpu {
+    pub fn new() -> Self {
+        Self {
+            id: 1,
+            active_slot: None,
+            hardware_command_counter: 0,
+        }
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        self.active_slot.is_none()
+    }
+}
+
+impl Default for Cpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
+════════════════════════════════════════════════════════
+FILE: ./domain/mod.rs
+════════════════════════════════════════════════════════
+mod cpu;
+mod process_control_block;
+mod process_state;
+
+pub use cpu::Cpu;
+pub use process_control_block::ProcessControlBlock;
+pub use process_state::ProcessState;
+
+
+════════════════════════════════════════════════════════
+FILE: ./domain/process_control_block.rs
+════════════════════════════════════════════════════════
+use super::ProcessState;
+
+/// Слово состояния процесса (PSW) модели ОС.
+#[derive(Debug, Clone)]
+pub struct ProcessControlBlock {
+    pub slot: i32,
+    pub task_id: i32,
+    pub size: i32,
+    pub command_counter: u64,
+    pub state: ProcessState,
+
+    // Поля зарезервированы для лабораторных 3–5.
+    pub base_priority: i32,
+    pub dynamic_priority: i32,
+    pub remaining_quantum: i32,
+}
+
+impl ProcessControlBlock {
+    pub fn new(task_id: i32, size: i32) -> Self {
+        Self {
+            slot: -1,
+            task_id,
+            size,
+            command_counter: 0,
+            state: ProcessState::Absent,
+            base_priority: 0,
+            dynamic_priority: 0,
+            remaining_quantum: 0,
+        }
+    }
+}
+
+
+════════════════════════════════════════════════════════
+FILE: ./domain/process_state.rs
+════════════════════════════════════════════════════════
+/// Состояния процесса, расширяемые в последующих лабораторных работах.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    Absent,
+    Ready,
+    Active,
+    BlockedIo,
+    Suspended,
+    Completed,
+}
+
+impl ProcessState {
+    /// Русское имя состояния для вывода на экран.
+    pub fn name(self) -> &'static str {
+        match self {
+            ProcessState::Absent => "Отсутствует",
+            ProcessState::Ready => "Готов",
+            ProcessState::Active => "Активен",
+            ProcessState::BlockedIo => "Блокирован IO",
+            ProcessState::Suspended => "Приостановлен",
+            ProcessState::Completed => "Завершён",
+        }
+    }
+}
+
+
+════════════════════════════════════════════════════════
+FILE: ./main.rs
+════════════════════════════════════════════════════════
+mod domain;
+mod services;
+mod ui;
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use services::SimulationModel;
+use std::env;
+use std::time::{Duration, Instant};
+
+fn print_help() {
+    println!("Модель ОС — лабораторная работа 1");
+    println!("Запуск: cargo run");
+    println!(
+        "Клавиши: + увеличить скорость на 10%, - уменьшить на 10%, R перезапуск, Q выход, H справка."
+    );
+}
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "/?" || a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
+    let mut model = SimulationModel::default_new();
+    model.initialize();
+
+    if args.iter().any(|a| a == "--snapshot") {
+        for _ in 0..12 {
+            model.execute_one_tick();
+        }
+        ui::draw(&model, false);
+        return Ok(());
+    }
+
+    enable_raw_mode()?;
+    print!("\x1B[?25l");
+
+    let mut last_tick_at = Instant::now();
+    let mut last_draw_at = Instant::now() - Duration::from_secs(1);
+    let mut show_help = false;
+    let mut running = true;
+
+    while running {
+        while event::poll(Duration::from_millis(0))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('+') | KeyCode::Char('=') => model.change_speed(1.10),
+                        KeyCode::Char('-') | KeyCode::Char('_') => model.change_speed(0.90),
+                        KeyCode::Char('r') | KeyCode::Char('R') => model.initialize(),
+                        KeyCode::Char('h') | KeyCode::Char('H') => show_help = !show_help,
+                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => running = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let now = Instant::now();
+        let tick_period = Duration::from_secs_f64(1.0 / model.speed_ticks_per_second());
+        while now.duration_since(last_tick_at) >= tick_period {
+            model.execute_one_tick();
+            last_tick_at += tick_period;
+        }
+
+        if now.duration_since(last_draw_at) >= Duration::from_millis(100) {
+            ui::draw(&model, show_help);
+            last_draw_at = now;
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    disable_raw_mode()?;
+    ui::cleanup();
+    println!("Моделирование завершено.");
+    Ok(())
+}
+
+
+════════════════════════════════════════════════════════
+FILE: ./services/mod.rs
+════════════════════════════════════════════════════════
+mod simulation_model;
+pub use simulation_model::SimulationModel;
+
+
+════════════════════════════════════════════════════════
+FILE: ./services/simulation_model.rs
+════════════════════════════════════════════════════════
+use crate::domain::{Cpu, ProcessControlBlock, ProcessState};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+/// Ядро учебной модели ОС.
+
+pub struct SimulationModel {
+    rng: StdRng,
+    process_table: Vec<Option<ProcessControlBlock>>,
+    next_task_id: i32,
+    total_memory: i32,
+    model_tick: u64,
+    speed_ticks_per_second: f64,
+    pub cpu: Cpu,
+    pub new_task: Option<ProcessControlBlock>,
+}
+
+impl SimulationModel {
+    pub fn new(memory_size: i32, process_table_size: usize, random_seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(random_seed),
+            process_table: vec![None; process_table_size],
+            next_task_id: 1,
+            total_memory: memory_size,
+            model_tick: 0,
+            speed_ticks_per_second: 2.0,
+            cpu: Cpu::new(),
+            new_task: None,
+        }
+    }
+
+    /// Значения по умолчанию: 2048 ед. памяти, 8 слотов PSW, seed = 14.
+    pub fn default_new() -> Self {
+        Self::new(2048, 8, 14)
+    }
+
+    // ---- Чтение состояния ----
+
+    pub fn total_memory(&self) -> i32 {
+        self.total_memory
+    }
+
+    pub fn used_memory(&self) -> i32 {
+        self.process_table
+            .iter()
+            .filter_map(|p| p.as_ref())
+            .map(|p| p.size)
+            .sum()
+    }
+
+    pub fn free_memory(&self) -> i32 {
+        self.total_memory - self.used_memory()
+    }
+
+    pub fn process_table_capacity(&self) -> usize {
+        self.process_table.len()
+    }
+
+    pub fn resident_process_count(&self) -> usize {
+        self.process_table.iter().filter(|p| p.is_some()).count()
+    }
+
+    pub fn model_tick(&self) -> u64 {
+        self.model_tick
+    }
+
+    pub fn speed_ticks_per_second(&self) -> f64 {
+        self.speed_ticks_per_second
+    }
+
+    pub fn process_table(&self) -> &[Option<ProcessControlBlock>] {
+        &self.process_table
+    }
+
+    pub fn active_process(&self) -> Option<&ProcessControlBlock> {
+        self.cpu
+            .active_slot
+            .and_then(|s| self.process_table[s].as_ref())
+    }
+
+    // ---- Процедуры модели ----
+
+    /// Инициализация модели
+    pub fn initialize(&mut self) {
+        for slot in self.process_table.iter_mut() {
+            *slot = None;
+        }
+        self.cpu.active_slot = None;
+        self.cpu.hardware_command_counter = 0;
+        self.model_tick = 0;
+        self.next_task_id = 1;
+        self.new_task = None;
+
+        self.generate_new_task();
+        while self.load_new_task() {
+            self.generate_new_task();
+        }
+        self.dispatch_first_ready_process();
+    }
+
+    /// Генерация нового задания со случайным размером 96..384.
+    pub fn generate_new_task(&mut self) {
+        let size = self.rng.gen_range(96..385);
+        let id = self.next_task_id;
+        self.next_task_id += 1;
+        self.new_task = Some(ProcessControlBlock::new(id, size));
+    }
+
+    /// Проверка наличия свободной памяти.
+    pub fn has_available_memory(&self) -> bool {
+        match &self.new_task {
+            Some(t) => t.size <= self.free_memory(),
+            None => false,
+        }
+    }
+
+    /// Загрузка нового задания в первую свободную запись таблицы PSW.
+    pub fn load_new_task(&mut self) -> bool {
+        if !self.has_available_memory() {
+            return false;
+        }
+        let slot = match self.process_table.iter().position(|p| p.is_none()) {
+            Some(s) => s,
+            None => return false,
+        };
+        if let Some(mut task) = self.new_task.take() {
+            task.slot = slot as i32;
+            task.state = ProcessState::Ready;
+            self.process_table[slot] = Some(task);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Выполнение одного такта активного процесса.
+    pub fn execute_one_tick(&mut self) {
+        if self.cpu.active_slot.is_none() {
+            self.dispatch_first_ready_process();
+        }
+        if let Some(slot) = self.cpu.active_slot {
+            if let Some(process) = self.process_table[slot].as_mut() {
+                process.command_counter += 1;
+                self.cpu.hardware_command_counter += 1;
+            }
+        }
+        self.model_tick += 1;
+    }
+
+    /// Изменение скорости с ограничением [0.1; 1000.0]
+    pub fn change_speed(&mut self, multiplier: f64) {
+        self.speed_ticks_per_second = (self.speed_ticks_per_second * multiplier).clamp(0.1, 1000.0);
+    }
+
+    /// Выбор первого готового процесса и передача его на ЦП.
+    fn dispatch_first_ready_process(&mut self) {
+        let slot = self
+            .process_table
+            .iter()
+            .position(|p| matches!(p.as_ref().map(|x| x.state), Some(ProcessState::Ready)));
+        if let Some(slot) = slot {
+            if let Some(process) = self.process_table[slot].as_mut() {
+                process.state = ProcessState::Active;
+                self.cpu.active_slot = Some(slot);
+                self.cpu.hardware_command_counter = process.command_counter;
+            }
+        }
+    }
+}
+
+
+════════════════════════════════════════════════════════
+FILE: ./ui/console_renderer.rs
+════════════════════════════════════════════════════════
+use crate::services::SimulationModel;
+use std::io::Write;
+
+/// Отрисовка текущего состояния модели на экране.
+pub fn draw(model: &SimulationModel, show_help: bool) {
+    let mut buf = String::new();
+
+    // ANSI: очистить экран и вернуть курсор в левый верхний угол.
+    buf.push_str("\x1B[2J\x1B[1;1H");
+
+    buf.push_str(&format!(
+        "Такт модели: {:<8} Скорость: {:>7.1} такт/с\r\n",
+        model.model_tick(),
+        model.speed_ticks_per_second()
+    ));
+
+    let cpu_status = if model.cpu.is_waiting() {
+        "ОЖИДАНИЕ"
+    } else {
+        "РАБОТА"
+    };
+    let active_id = model
+        .active_process()
+        .map(|p| p.task_id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    buf.push_str(&format!(
+        "ЦП-{}: {:<10} Активный процесс: {:<3} Счётчик команд: {}\r\n",
+        model.cpu.id, cpu_status, active_id, model.cpu.hardware_command_counter
+    ));
+    buf.push_str(&format!(
+        "Память: занято {}/{}, свободно {}; PSW: {}/{}\r\n",
+        model.used_memory(),
+        model.total_memory(),
+        model.free_memory(),
+        model.resident_process_count(),
+        model.process_table_capacity()
+    ));
+
+    buf.push_str("\r\n");
+    buf.push_str(" №  ID    Размер   Счётчик команд   Состояние\r\n");
+    buf.push_str(&format!("{}\r\n", "-".repeat(54)));
+
+    for process in model.process_table() {
+        if let Some(p) = process {
+            buf.push_str(&format!(
+                "{:>2}  {:>2}    {:>5}   {:>14}   {}\r\n",
+                p.slot + 1,
+                p.task_id,
+                p.size,
+                p.command_counter,
+                p.state.name()
+            ));
+        }
+    }
+
+    buf.push_str("\r\n");
+    match &model.new_task {
+        None => buf.push_str("Новое задание: нет\r\n"),
+        Some(task) => buf.push_str(&format!(
+            "Новое задание: ID {}, {} ед. памяти\r\n",
+            task.task_id, task.size
+        )),
+    }
+    buf.push_str(
+        "Управление: [+] быстрее  [-] медленнее  [R] перезапуск  [Q] выход  [H] справка\r\n",
+    );
+
+    if show_help {
+        buf.push_str("\r\n");
+        buf.push_str("Справка: +/- изменяют скорость на 10%; R инициализирует модель; Q завершает моделирование.\r\n");
+        buf.push_str("Параметр запуска /? выводит эту справку и завершает программу.\r\n");
+    }
+
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(buf.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// Очистка экрана и восстановление курсора.
+pub fn cleanup() {
+    print!("\x1B[2J\x1B[1;1H\x1B[?25h");
+    let _ = std::io::stdout().flush();
+}
+
+
+════════════════════════════════════════════════════════
+FILE: ./ui/mod.rs
+════════════════════════════════════════════════════════
+mod console_renderer;
+pub use console_renderer::{cleanup, draw};
+
+

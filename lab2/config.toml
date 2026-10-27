@@ -1,0 +1,14 @@
+
+[model]
+memory_min = 1024
+memory_max = 4096
+process_table_size = 8   # число слотов в таблице PSW
+random_seed = 14         # зерно ГПСЧ
+
+
+[task]
+size_min = 96
+size_max = 384
+# Параметры процессора
+[cpu]
+id = 1
